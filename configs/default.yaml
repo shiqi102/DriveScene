@@ -1,0 +1,92 @@
+data_root: data/nuscenes
+version: v1.0-mini
+base_manifest: data/processed/mini-v3.jsonl
+manifest: data/processed/mini-v3-with-occ.jsonl
+output: outputs
+artifact_output: /mnt/sh_data/common3share/17_端到端/users/wzy/DriveScene/outputs
+camera_order: [CAM_FRONT, CAM_FRONT_RIGHT, CAM_BACK_RIGHT, CAM_BACK, CAM_BACK_LEFT, CAM_FRONT_LEFT]
+grid:
+  x: [-30.0, 30.0]
+  y: [-30.0, 30.0]
+  z: [-2.0, 6.0]
+  shape: [60, 60, 8]
+model:
+  backend: native_research
+  image_size: [256, 448]
+  channels: 128
+  map_queries: 80
+  map_points: 20
+  detection_queries: 128
+  layers: 2
+  heads: 8
+  checkpoint: null
+  map_classes: [divider, centerline, boundary, pedestrian_crossing, stop_line]
+  detection_classes: [car, truck, construction_vehicle, bus, trailer, barrier, motorcycle, bicycle, pedestrian, traffic_cone]
+  occupancy_classes: [free, occupied, drivable]
+tracking:
+  track_high_thresh: 0.5
+  track_low_thresh: 0.1
+  new_track_thresh: 0.6
+  track_buffer: 30
+  match_thresh: 0.8
+  fuse_score: true
+compiler:
+  detection_confidence: {car: 0.45, truck: 0.45, construction_vehicle: 0.50, bus: 0.45, trailer: 0.50, barrier: 0.50, motorcycle: 0.50, bicycle: 0.50, pedestrian: 0.45, traffic_cone: 0.50}
+  detection_geometry:
+    min_size: [0.15, 0.15, 0.15]
+    max_size: [20.0, 8.0, 8.0]
+    max_speed: 45.0
+    nms_iou: 0.25
+    nms_center_distance: 1.0
+  map_confidence: {divider: 0.55, centerline: 0.60, boundary: 0.60, pedestrian_crossing: 0.60, stop_line: 0.65}
+  map_geometry:
+    min_length: {divider: 2.0, centerline: 2.0, boundary: 3.0, pedestrian_crossing: 2.0, stop_line: 1.0}
+    max_length: 85.0
+    max_step: {divider: 5.0, centerline: 4.0, boundary: 5.0, pedestrian_crossing: 5.0, stop_line: 2.0}
+    max_turn_degrees: 150.0
+    smoothing_passes: 1
+    duplicate_chamfer: 1.0
+  map_temporal:
+    enabled: true
+    match_chamfer: 2.0
+    ema: 0.65
+    min_hits: 2
+    max_age: 1
+    score_decay: 0.85
+    max_vectors: 64
+  # Sparse LiDAR supervision cannot constrain the whole 3D volume. Preserve
+  # low-confidence predictions as unknown instead of forcing a semantic class.
+  occupancy_confidence: {free: 0.60, occupied: 0.97, drivable: 0.85}
+  occupancy_geometry:
+    minimum_neighbors: 3
+    max_occupied_voxels_per_column: 4
+    drivable_z: [-2.0, 0.5]
+  unknown_cost: 0.7
+  agent_margin: 0.3
+  light_max_distance: 30.0
+traffic_lights:
+  checkpoint: checkpoints/yolov8n.pt
+  state_classes: {red: red, yellow: yellow, green: green, off: off}
+training:
+  # Ray tracing produces many more free samples than surface returns. These
+  # weights retain useful obstacle and drivable-surface gradients.
+  occupancy_class_weights: [0.2, 1.0, 1.0]
+  learning_rate: 5.0e-5
+  map_loss:
+    classification: 1.0
+    point: 1.0
+    direction: 0.25
+    smoothness: 0.10
+    topology: 0.10
+    duplicate: 0.10
+    topology_radius: 2.0
+    duplicate_margin: 1.5
+  detection_loss:
+    classification: 2.0
+    center: 5.0
+    size: 2.0
+    orientation: 1.0
+    velocity: 0.5
+    bev_iou: 2.0
+    focal_gamma: 2.0
+    no_object_weight: 0.5
