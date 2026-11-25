@@ -44,8 +44,8 @@ compiler:
   detection_geometry:
     min_size: [0.15, 0.15, 0.15]
     max_size: [20.0, 8.0, 8.0]
-    max_speed: 45.0
     nms_iou: 0.2
+    max_speed: 40.0
     nms_center_distance: 1.0
   map_confidence: {divider: 0.55, centerline: 0.60, boundary: 0.60, pedestrian_crossing: 0.60, stop_line: 0.65}
   map_geometry:
