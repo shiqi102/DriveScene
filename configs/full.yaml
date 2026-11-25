@@ -61,7 +61,7 @@ compiler:
     ema: 0.65
     min_hits: 2
     max_age: 1
-    score_decay: 0.85
+    score_decay: 0.87
     max_vectors: 64
   # Sparse LiDAR supervision cannot constrain the whole 3D volume. Preserve
   # low-confidence predictions as unknown instead of forcing a semantic class.
