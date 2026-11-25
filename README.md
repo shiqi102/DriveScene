@@ -5,7 +5,6 @@ Training and inference intermediates stay under the local `outputs/` directory.
 `DRIVESCENE_ARTIFACT_OUTPUT` to write them to a shared filesystem, for example
 `/mnt/sh_data/common3share/17_端到端/users/wzy/DriveScene/outputs`.
 
-项目位于 42 服务器 `/Data1/wzy/DriveScene`，输入 nuScenes 六路环视相机，输出矢量地图、动态目标、占据和交通灯图层，统一编译为车体坐标系下的 WorldModel。
 
 ## 当前状态
 
