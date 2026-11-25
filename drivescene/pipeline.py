@@ -6,10 +6,12 @@ import torch
 from .data import camera_tensor, read_manifest
 from .models import SharedBEVModel, supervised_loss
 from .compiler import compile_scene, save_world
-from .tracking import BEVByteTracker
+from .tracking import CenterTracker
 from .visualize import render_world
 from .map_postprocess import MapTemporalStabilizer, postprocess_map
 from .detection_postprocess import postprocess_detections
+from .training import (apply_bev_augment, build_train_loader, cosine_warmup_lr,
+                       sample_scene_augment, validation_losses)
 
 
 def _filter_occupancy(labels, confidence, config):
@@ -95,10 +97,10 @@ def decode(prediction, config, trained_tasks):
     return vectors, boxes, occupancy, map_candidates, detection_candidates
 
 
-def run(config, manifest, output, mode, checkpoint=None, limit=5, device="cpu", lights=False):
+def run(config, manifest, output, mode, checkpoint=None, limit=None, device="cpu", lights=False):
     if mode not in ("annotations", "native_research"):
         raise ValueError("Unsupported inference mode")
-    tracker = BEVByteTracker(config["tracking"])
+    tracker = CenterTracker(config["tracking"])
     map_stabilizer = MapTemporalStabilizer(config)
     model, trained_tasks = None, []
     if mode == "native_research":
@@ -126,7 +128,9 @@ def run(config, manifest, output, mode, checkpoint=None, limit=5, device="cpu", 
         if model:
             images, projection = camera_tensor(row, config["model"]["image_size"])
             pose = np.asarray(row["ego_to_global"])
-            if previous_scene != row["scene_token"] or (previous_time is not None and row["timestamp_us"]-previous_time > 1_500_000):
+            if (previous_scene != row["scene_token"] or
+                    (previous_time is not None and row["timestamp_us"]-previous_time > 1_500_000) or
+                    (previous_time is not None and row["timestamp_us"] <= previous_time)):
                 previous = None
             transform = None if previous is None else torch.tensor(np.linalg.inv(previous_pose) @ pose, device=device, dtype=torch.float32)[None]
             with torch.no_grad():
@@ -263,6 +267,7 @@ def train(config, manifest, output, steps=10, device="cpu", backbone=None,
                 if torch.is_tensor(value):
                     state[key] = value.to(device)
     rows = [r for r in read_manifest(manifest) if r["split"] == "train"]
+    val_rows = [r for r in read_manifest(manifest) if r["split"] == "val"]
     if not rows:
         raise ValueError("Training manifest has no train scenes")
     map_supervision = _validate_map_supervision(rows, config)
@@ -283,6 +288,10 @@ def train(config, manifest, output, steps=10, device="cpu", backbone=None,
                if rank == 0 and resume_state and history_path.is_file() else [])
     trained_tasks = set(resume_state.get("trained_tasks", [])) if resume_state else set()
     previous, previous_pose, previous_scene, previous_time = None, None, None, None
+    scene_transform = np.eye(4, dtype=np.float32)
+    lr_decay = 1.0
+    warmup = int(config.get("training", {}).get("warmup_steps", 250))
+    loader = build_train_loader(local_rows, config, steps, start_step, device, rank)
     def save_checkpoint(path, completed_steps):
         if rank != 0:
             return
@@ -300,25 +309,26 @@ def train(config, manifest, output, steps=10, device="cpu", backbone=None,
         temporary.replace(path)
         history_path.write_text(json.dumps(history, indent=2))
 
-    for step in range(start_step, steps):
+    for step, sample in zip(range(start_step, steps), loader):
         # Whole scenes stay on one rank, allowing each worker to train temporal
         # fusion on consecutive frames while DDP synchronizes task gradients.
-        row = local_rows[step % len(local_rows)]
-        images, projection = camera_tensor(row, config["model"]["image_size"])
-        pose = np.asarray(row["ego_to_global"])
-        if (previous_scene != row["scene_token"] or
-                (previous_time is not None and row["timestamp_us"]-previous_time > 1_500_000) or
-                (previous_time is not None and row["timestamp_us"] <= previous_time)):
+        scheduled = cosine_warmup_lr(step, steps, learning_rate, warmup) * lr_decay
+        for group in optimizer.param_groups:
+            group["lr"] = scheduled
+        if sample["scene_token"] != previous_scene:
+            scene_transform = sample_scene_augment(config)
+            previous = None
+        sample = apply_bev_augment(sample, scene_transform, config["grid"])
+        images, projection = sample["images"], sample["projection"]
+        pose = np.asarray(sample["pose"], dtype=np.float32)
+        timestamp = int(sample["timestamp_us"])
+        if (previous_scene != sample["scene_token"] or
+                (previous_time is not None and timestamp-previous_time > 1_500_000) or
+                (previous_time is not None and timestamp <= previous_time)):
             previous = None
         transform = None if previous is None else torch.tensor(
             np.linalg.inv(previous_pose) @ pose, device=device, dtype=torch.float32)[None]
-        target = dict(row["targets"])
-        # Occupancy from explicit normalized labels only. Original Occ3D must be converted first.
-        if target.get("occupancy_path"):
-            with np.load(target["occupancy_path"]) as labels:
-                if "drivescene_semantic" not in labels:
-                    raise ValueError("Run convert-occupancy; raw Occ3D IDs/grid cannot be used directly")
-                target["occupancy"] = labels["drivescene_semantic"]
+        target = sample["target"]
         optimizer.zero_grad(set_to_none=True)
         pred = model(images[None].to(device), projection[None].to(device), previous, transform)
         predictions_finite = torch.tensor(
@@ -354,15 +364,14 @@ def train(config, manifest, output, steps=10, device="cpu", backbone=None,
         if not int(gradients_finite):
             optimizer.zero_grad(set_to_none=True)
             previous = previous_pose = previous_scene = previous_time = None
-            for group in optimizer.param_groups:
-                group["lr"] *= .5
+            lr_decay *= .5
             if rank == 0:
                 print(json.dumps({"step": step+1, "warning": "non-finite gradient; step skipped",
-                                  "new_lr": optimizer.param_groups[0]["lr"]}), flush=True)
+                                  "new_lr": scheduled * 0.5}), flush=True)
             continue
         optimizer.step()
         previous, previous_pose = pred["bev"].detach(), pose
-        previous_scene, previous_time = row["scene_token"], row["timestamp_us"]
+        previous_scene, previous_time = sample["scene_token"], timestamp
         trained_tasks.update(losses)
         reported = {name: value.detach().clone() for name, value in losses.items()}
         if world_size > 1:
@@ -371,10 +380,16 @@ def train(config, manifest, output, steps=10, device="cpu", backbone=None,
                 value /= world_size
         if rank == 0:
             record = {"step": step+1, **{k: float(v) for k, v in reported.items()},
-                      "grad_norm": float(grad_norm)}
+                      "grad_norm": float(grad_norm), "lr": scheduled}
             history.append(record)
             print(json.dumps(record), flush=True)
         if (step+1) % save_every == 0:
+            if rank == 0 and val_rows:
+                record = history[-1] if history else {}
+                record["val"] = validation_losses(
+                    model, val_rows, config, device,
+                    int(config.get("training", {}).get("val_frames", 16)))
+                print(json.dumps({"step": step+1, "val": record["val"]}), flush=True)
             save_checkpoint(directory / "latest.pt", step+1)
     checkpoint = directory / "last.pt"
     save_checkpoint(checkpoint, steps)

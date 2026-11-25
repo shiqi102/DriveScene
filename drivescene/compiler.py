@@ -81,8 +81,8 @@ def compile_scene(frame, config, occupancy=None):
     band = (zcenters >= -1.0) & (zcenters <= 2.0)
     if not band.any():
         raise ValueError("Grid has no vehicle-height voxels")
-    unknown = (semantic[:, :, band] == 255).any(-1)
-    cost = np.where(unknown, cfg["unknown_cost"], 0).astype(np.float32)
+    unknown_fraction = (semantic[:, :, band] == 255).mean(-1)
+    cost = (unknown_fraction * cfg["unknown_cost"]).astype(np.float32)
     static_2d = static_occupied[:, :, band].any(-1)
     agent_2d = agent_mask[:, :, band].any(-1)
     cost[static_2d | agent_2d] = 1.0

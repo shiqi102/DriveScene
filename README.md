@@ -1,9 +1,9 @@
 # DriveScene
 
 Training and inference intermediates stay under the local `outputs/` directory.
-For the `video` and `mcap` commands, legacy paths beginning with `outputs/` are
-written under `/mnt/sh_data/common3share/17_端到端/users/wzy/DriveScene/outputs`
-so generated MP4 and MCAP artifacts are available from the shared filesystem.
+`video` / `mcap` artifacts also default to `outputs/`. Set
+`DRIVESCENE_ARTIFACT_OUTPUT` to write them to a shared filesystem, for example
+`/mnt/sh_data/common3share/17_端到端/users/wzy/DriveScene/outputs`.
 
 项目位于 42 服务器 `/Data1/wzy/DriveScene`，输入 nuScenes 六路环视相机，输出矢量地图、动态目标、占据和交通灯图层，统一编译为车体坐标系下的 WorldModel。
 
@@ -16,6 +16,10 @@ so generated MP4 and MCAP artifacts are available from the shared filesystem.
 - `outputs/train-all-tasks-smoke/last.pt` 仅训练 2 步，只用于接口检查，不代表模型精度。
 - 原生 perception-v3 使用 80 个地图查询与 128 个检测查询；检测标注严格裁剪到 BEV，采用 focal、归一化框、方向和 BEV-IoU 损失；地图包含方向、曲率、拓扑、融合后 NMS；占据采用逐高度可见性和空间过滤。旧 checkpoint 与新结构不兼容。
 - MapTRv2 官方 nuScenes 配置的模型权重在上游表格中仍标为 WIP；OccFormer 下载未完成，`.part` 文件不可使用。
+- 地图标注改为 road_segment/lane 与 ped_crossing 先 union 再取外轮廓；旧 `mini-v3*.jsonl` 含内部拼缝，需重新 `prepare`。闭合折线按起点平移匹配，匈牙利代价已按网格归一化。
+- 跟踪改为 CenterPoint 风格的全局中心距离 + 匀速预测，不再使用图像 ByteTrack。
+- 训练使用 DataLoader 预取、warmup+cosine 学习率、场景级 BEV 旋转/翻转和颜色抖动，并在保存 checkpoint 时记录 val loss。
+- `run --limit` 默认处理整个 manifest。官方检测/跟踪指标仍按 50 m / 40 m 协议计算，但模型输出只有 ±30 m，范围外真值会记为漏检。
 
 ## 进入项目和环境检查
 
@@ -171,7 +175,7 @@ CUDA_VISIBLE_DEVICES=<GPU_ID> \
 
 ## 4. 训练可运行的原生共享模型
 
-先生成严格裁剪的地图基础 manifest，再生成带射线占据监督的训练 manifest：
+先重新生成 union-outline 地图 manifest（旧 `mini-v3*.jsonl` 含 road_segment 内部拼缝），再生成带射线占据监督的训练 manifest：
 
 ```bash
 scripts/run.sh prepare \

@@ -1,6 +1,7 @@
 from __future__ import annotations
 import argparse
 import json
+import os
 from pathlib import Path
 import yaml
 
@@ -35,7 +36,8 @@ def main():
     run.add_argument("--manifest")
     run.add_argument("--checkpoint")
     run.add_argument("--output")
-    run.add_argument("--limit", type=int, default=5)
+    run.add_argument("--limit", type=int, default=None,
+                       help="Max frames; default is the full manifest")
     run.add_argument("--device", default="cpu")
     run.add_argument("--lights", action="store_true")
     train = commands.add_parser("train")
@@ -84,9 +86,13 @@ def main():
     args = parser.parse_args()
     config = yaml.safe_load(Path(args.config).read_text())
     output_root = Path(config["output"])
-    artifact_output_root = Path(config.get("artifact_output", config["output"]))
-    import torch
-    torch.set_num_threads(args.threads)
+    artifact_output_root = Path(
+        os.environ.get("DRIVESCENE_ARTIFACT_OUTPUT")
+        or config.get("artifact_output")
+        or config["output"])
+    if args.command in ("run", "train", "smoke", "doctor"):
+        import torch
+        torch.set_num_threads(args.threads)
     print_json = True
     if args.command == "prepare":
         from .data import prepare_nuscenes

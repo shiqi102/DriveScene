@@ -5,7 +5,7 @@ import pytest
 import yaml
 from drivescene.geometry import transform_matrix, transform_points, project
 from drivescene.compiler import compile_scene, associate_lights
-from drivescene.tracking import BEVByteTracker
+from drivescene.tracking import CenterTracker
 from drivescene.occupancy import _trace_free_voxels
 
 
@@ -63,7 +63,7 @@ def test_ambiguous_lights_do_not_get_arbitrary_stopline():
 
 
 def test_tracker_compensates_ego_motion(config):
-    tracker = BEVByteTracker(config["tracking"])
+    tracker = CenterTracker(config["tracking"])
     first = tracker.update([detection(10)], 1_000_000, np.eye(4), "a")
     moved_ego = np.eye(4)
     moved_ego[0, 3] = 1
@@ -86,3 +86,20 @@ def test_lidar_ray_marks_free_before_surface_only():
         np.array([.5, .5, .5]), np.array([[4.5, .5, .5]]),
         np.array([0., 0., 0.]), np.array([5., 1., 1.]), np.array([5, 1, 1]))
     assert indices.tolist() == [[0, 0, 0], [1, 0, 0], [2, 0, 0], [3, 0, 0]]
+
+
+def test_unknown_cost_scales_with_observed_fraction(config):
+    semantic = np.full(config["grid"]["shape"], 255, dtype=np.uint8)
+    semantic[4, 4, 1] = 0
+    _, arrays = compile_scene(frame(), config, semantic)
+    assert 0 < float(arrays["cost"][4, 4]) < 0.7
+
+
+def test_center_tracker_keeps_non_overlapping_pedestrian(config):
+    tracker = CenterTracker(config["tracking"])
+    pedestrian = {"center": [0.0, 0.0, 0.0], "size": [0.6, 0.6, 1.7], "yaw": 0.0,
+                  "kind": "pedestrian", "score": 0.9, "velocity": [1.6, 0.0]}
+    first = tracker.update([pedestrian], 0, np.eye(4), "scene")
+    moved = dict(pedestrian, center=[0.8, 0.0, 0.0])
+    second = tracker.update([moved], 500_000, np.eye(4), "scene")
+    assert first[0]["id"] == second[0]["id"]

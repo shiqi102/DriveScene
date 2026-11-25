@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import yaml
-from shapely.geometry import LineString
+from shapely.geometry import LineString, Polygon
 
 from drivescene.data import extract_map
 from drivescene.geometry import transform_matrix
@@ -111,3 +111,82 @@ def test_detection_nms_and_structured_loss():
     assert torch.isfinite(loss)
     loss.backward()
     assert torch.isfinite(logits.grad).all() and torch.isfinite(boxes.grad).all()
+
+
+class _SeamMap:
+    def get_records_in_patch(self, patch, layers, mode="intersect"):
+        result = {layer: [] for layer in layers}
+        result["road_segment"] = ["left", "right"]
+        return result
+
+    def get(self, layer, token):
+        return {"polygon_token": token}
+
+    def extract_polygon(self, token):
+        if token == "left":
+            return Polygon([(-20, -10), (0, -10), (0, 10), (-20, 10)])
+        return Polygon([(0, -10), (20, -10), (20, 10), (0, 10)])
+
+
+def test_union_boundary_drops_internal_seams():
+    vectors = extract_map(_SeamMap(), np.eye(4), {"x": [-30, 30], "y": [-30, 30]}, points=20)
+    boundaries = [vector for vector in vectors if vector["kind"] == "boundary"]
+    assert len(boundaries) == 1
+    assert boundaries[0]["closed"]
+
+
+def test_closed_ring_matching_is_shift_invariant():
+    config = _config()
+    count = config["model"]["map_points"]
+    theta = np.linspace(0, 2 * np.pi, count)
+    ring = np.stack([8 * np.cos(theta), 8 * np.sin(theta)], -1)
+    ring[-1] = ring[0]
+    body = np.roll(ring[:-1], -5, axis=0)
+    shifted = np.vstack([body, body[:1]])
+    class_index = config["model"]["map_classes"].index("pedestrian_crossing")
+    logits = torch.zeros(1, 2, len(config["model"]["map_classes"]) + 1)
+    logits[0, 0, class_index] = 8
+    logits[0, 1, -1] = 8
+    points = torch.tensor(np.stack([ring, ring + 40]), dtype=torch.float32)[None]
+    prediction = {"map": {"logits": logits, "points": points},
+                  "detection": {"logits": torch.empty(1, 0, 1), "boxes": torch.empty(1, 0, 10)},
+                  "occupancy": torch.empty(1, 3, 1, 1, 1)}
+    same = {"map_vectors": [{"kind": "pedestrian_crossing", "points": ring.tolist(), "closed": True}],
+            "boxes": None, "occupancy": None}
+    rolled = {"map_vectors": [{"kind": "pedestrian_crossing", "points": shifted.tolist(), "closed": True}],
+              "boxes": None, "occupancy": None}
+    assert torch.allclose(supervised_loss(prediction, [same], config)["map"],
+                          supervised_loss(prediction, [rolled], config)["map"], atol=1e-5)
+
+
+def test_map_postprocess_clips_out_of_grid_instead_of_dropping():
+    config = _config()
+    points = np.column_stack([np.linspace(10, 40, 20), np.zeros(20)])
+    output = postprocess_map([{"id": "a", "kind": "divider", "score": 0.9,
+                               "points": points.tolist()}], config)
+    assert output
+    clipped = np.asarray(output[0]["points"])
+    assert clipped[:, 0].max() <= 30 + 1e-4
+    assert clipped[:, 0].min() >= -30 - 1e-4
+
+
+def test_bev_flip_mirrors_boxes_and_map():
+    from drivescene.training import apply_bev_augment
+    flip = np.eye(4, dtype=np.float32)
+    flip[1] *= -1
+    sample = {
+        "images": torch.zeros(6, 3, 8, 8),
+        "projection": torch.eye(4)[None].repeat(6, 1, 1),
+        "pose": np.eye(4, dtype=np.float32),
+        "target": {
+            "boxes": [{"center": [5.0, 2.0, 0.0], "size": [4.0, 2.0, 1.5],
+                       "yaw": 0.3, "velocity": [1.0, 0.2], "kind": "car"}],
+            "map_vectors": [{"kind": "divider", "points": [[5.0, 2.0], [10.0, 2.0]],
+                             "score": 1.0, "closed": False}],
+            "occupancy": None,
+        },
+    }
+    grid = {"x": [-30, 30], "y": [-30, 30], "z": [-2, 6], "shape": [8, 8, 4]}
+    output = apply_bev_augment(sample, flip, grid)
+    np.testing.assert_allclose(output["target"]["boxes"][0]["center"][1], -2.0)
+    np.testing.assert_allclose(np.asarray(output["target"]["map_vectors"][0]["points"])[:, 1], -2.0)

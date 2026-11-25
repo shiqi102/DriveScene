@@ -13,7 +13,7 @@ dependencies = ["numpy>=1.24,<2", "scipy>=1.10", "Pillow>=9", "PyYAML>=6", "shap
 models = ["torch>=2.0", "torchvision>=0.15", "ultralytics==8.3.0", "lapx==0.5.11"]
 data = ["nuscenes-devkit==1.1.11", "pyquaternion>=0.9.9"]
 test = ["pytest>=8"]
-visualization = ["mcap>=1.2", "mcap-protobuf-support>=0.5", "foxglove-schemas-protobuf>=0.3"]
+visualization = ["mcap>=1.2", "mcap-protobuf-support>=0.5", "foxglove-schemas-protobuf>=0.3", "imageio>=2.31", "imageio-ffmpeg>=0.4"]
 evaluation = ["nuscenes-devkit==1.1.11", "motmetrics==1.4.0", "pandas>=1.5,<2"]
 
 [project.scripts]

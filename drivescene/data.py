@@ -15,9 +15,36 @@ def read_manifest(path):
                 yield json.loads(line)
 
 
+def _polygon_parts(geometry):
+    if geometry.is_empty:
+        return []
+    if geometry.geom_type == "Polygon":
+        return [geometry]
+    return [part for part in getattr(geometry, "geoms", []) if part.geom_type == "Polygon"]
+
+
+def _line_parts(geometry):
+    """Split a clipped geometry into lines, re-joining pieces of a cut ring."""
+    from shapely.ops import linemerge
+    if geometry.is_empty:
+        return []
+    if geometry.geom_type == "MultiLineString":
+        geometry = linemerge(geometry)
+    if geometry.geom_type in ("LineString", "LinearRing"):
+        return [geometry]
+    return [part for part in getattr(geometry, "geoms", [])
+            if part.geom_type in ("LineString", "LinearRing")]
+
+
 def extract_map(nmap, ego_to_global, grid, points=20):
-    """Extract supervision clipped to the exact model grid in ego coordinates."""
+    """Extract supervision clipped to the exact model grid in ego coordinates.
+
+    Road boundaries are the outline of the union of road segments and lanes, so
+    seams between adjacent segments are not labelled as boundaries. Crossings
+    are unioned as well. `closed` marks rings whose start point is arbitrary.
+    """
     from shapely.geometry import box, LineString, Polygon
+    from shapely.ops import unary_union
     x0, x1 = grid["x"]
     y0, y1 = grid["y"]
     local_corners = np.array([[x0, y0, 0], [x1, y0, 0],
@@ -32,27 +59,16 @@ def extract_map(nmap, ego_to_global, grid, points=20):
     vectors = []
 
     def append_geometry(geometry, kind, token):
-        geometry = geometry.intersection(global_clip)
-        if geometry.is_empty:
-            return
-        if hasattr(geometry, "geoms"):
-            for part in geometry.geoms:
-                append_geometry(part, kind, token)
-        elif geometry.geom_type in ("LineString", "LinearRing") and geometry.length > 0.2:
-            global_xy = np.asarray(geometry.coords, dtype=np.float64)[:, :2]
+        for part in _line_parts(geometry.intersection(global_clip)):
+            if part.length <= 0.2:
+                continue
+            global_xy = np.asarray(part.coords, dtype=np.float64)[:, :2]
             global_xyz = np.column_stack([global_xy, np.full(len(global_xy), ego_to_global[2, 3])])
             ego_xy = transform_points(global_xyz, inverse)[:, :2]
             # A second ego-frame clip removes numerical spill and makes the
             # supervision contract explicit even for rotated map patches.
-            local_geometry = LineString(ego_xy).intersection(local_clip)
-            if local_geometry.is_empty:
-                return
-            if hasattr(local_geometry, "geoms"):
-                for part in local_geometry.geoms:
-                    if part.geom_type in ("LineString", "LinearRing"):
-                        append_local(part, kind, token)
-            else:
-                append_local(local_geometry, kind, token)
+            for local in _line_parts(LineString(ego_xy).intersection(local_clip)):
+                append_local(local, kind, token)
 
     def append_local(geometry, kind, token):
         if geometry.length <= .2:
@@ -61,26 +77,35 @@ def extract_map(nmap, ego_to_global, grid, points=20):
         xy[:, 0] = np.clip(xy[:, 0], x0, x1)
         xy[:, 1] = np.clip(xy[:, 1], y0, y1)
         vectors.append({"id": f"{kind}:{token}:{len(vectors)}", "kind": kind,
-                        "points": xy.tolist(), "score": 1.0})
+                        "points": xy.tolist(), "score": 1.0,
+                        "closed": bool(geometry.is_closed)})
 
-    for layer, kind in [("lane_divider", "divider"), ("road_divider", "divider"),
-                        ("road_segment", "boundary"), ("ped_crossing", "pedestrian_crossing"),
-                        ("stop_line", "stop_line")]:
+    def append_union_outline(layers, kind):
+        polygons = [nmap.extract_polygon(nmap.get(layer, token)["polygon_token"]).buffer(0)
+                    for layer in layers for token in records[layer]]
+        polygons = [polygon for polygon in polygons if not polygon.is_empty]
+        if not polygons:
+            return
+        for index, polygon in enumerate(_polygon_parts(unary_union(polygons))):
+            for ring in (polygon.exterior, *polygon.interiors):
+                append_geometry(LineString(ring.coords), kind, f"union{index}")
+
+    for layer in ("lane_divider", "road_divider"):
         for token in records[layer]:
-            record = nmap.get(layer, token)
-            if "line_token" in record:
-                geometry = nmap.extract_line(record["line_token"])
-            else:
-                polygon = nmap.extract_polygon(record["polygon_token"])
-                if kind == "stop_line":
-                    # Short axis across the minimum rectangle gives a stop-line segment.
-                    rect = np.asarray(polygon.minimum_rotated_rectangle.exterior.coords)[:4]
-                    mids = (rect + np.roll(rect, -1, axis=0))/2
-                    candidates = [LineString([mids[i], mids[i+2]]) for i in range(2)]
-                    geometry = max(candidates, key=lambda item: item.length)
-                else:
-                    geometry = polygon.boundary
-            append_geometry(geometry, kind, token)
+            append_geometry(nmap.extract_line(nmap.get(layer, token)["line_token"]), "divider", token)
+    append_union_outline(("road_segment", "lane"), "boundary")
+    append_union_outline(("ped_crossing",), "pedestrian_crossing")
+    for token in records["stop_line"]:
+        record = nmap.get("stop_line", token)
+        if "line_token" in record:
+            append_geometry(nmap.extract_line(record["line_token"]), "stop_line", token)
+            continue
+        polygon = nmap.extract_polygon(record["polygon_token"])
+        # Long axis of the painted rectangle is the stop-line segment.
+        rect = np.asarray(polygon.minimum_rotated_rectangle.exterior.coords)[:4]
+        mids = (rect + np.roll(rect, -1, axis=0))/2
+        candidates = [LineString([mids[i], mids[i+2]]) for i in range(2)]
+        append_geometry(max(candidates, key=lambda item: item.length), "stop_line", token)
     if records["lane"]:
         for token, pts in nmap.discretize_lanes(records["lane"], 1.0).items():
             if len(pts) > 1:
@@ -108,7 +133,8 @@ def prepare_nuscenes(root, version, output, limit=None, map_points=20, grid=None
               "detection_boxes_outside_grid_removed": 0,
               "detection_boxes_without_sensor_points_removed": 0,
               "occupancy_labels": 0, "traffic_state_labels": 0,
-              "map_grid": {key: grid[key] for key in ("x", "y")}}
+              "map_grid": {key: grid[key] for key in ("x", "y")},
+              "map_label_revision": "union-outline-v1"}
     with output.open("w") as stream:
         ordered = sorted(nusc.sample, key=lambda sample: (sample["scene_token"], sample["timestamp"]))
         for sample in ordered[:limit]:
@@ -164,7 +190,8 @@ def prepare_nuscenes(root, version, output, limit=None, map_points=20, grid=None
             vectors = extract_map(maps[location], ego_to_global, grid, points=map_points) if location in maps else None
             # Dense occupancy and signal states are not part of base nuScenes labels.
             occ_path = root.parent / "occupancy" / scene["name"] / sample["token"] / "labels.npz"
-            row = {"schema_version": "1.1", "sample_token": sample["token"], "scene_token": sample["scene_token"],
+            row = {"schema_version": "1.2", "map_label_revision": "union-outline-v1",
+                   "sample_token": sample["token"], "scene_token": sample["scene_token"],
                    "scene_name": scene["name"], "timestamp_us": ref["timestamp"],
                    "split": "train" if scene["name"] in train_names else "val",
                    "ego_to_global": ego_to_global.tolist(), "cameras": cameras,
@@ -182,7 +209,10 @@ def prepare_nuscenes(root, version, output, limit=None, map_points=20, grid=None
                 counts["max_map_vectors_per_frame"] = max(counts["max_map_vectors_per_frame"], len(vectors))
                 for vector in vectors:
                     xy = np.asarray(vector["points"])
-                    counts["map_points_outside_grid"] += int(
+                 
+                    
+                       
+                   counts["map_points_outside_grid"] += int(
                         ((xy[:, 0] < grid["x"][0]-1e-5) | (xy[:, 0] > grid["x"][1]+1e-5) |
                          (xy[:, 1] < grid["y"][0]-1e-5) | (xy[:, 1] > grid["y"][1]+1e-5)).sum())
             counts["occupancy_labels"] += occ_path.exists()

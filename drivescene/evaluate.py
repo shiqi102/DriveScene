@@ -214,7 +214,7 @@ def _occupancy_metrics(rows, prediction_directory, class_names):
         "per_frame_mIoU": per_frame,
         "limitations": [
             "These labels are sparse LiDARseg-derived voxels, not Occ3D dense semantics or mask_camera.",
-            "The current validation labels contain no supervised free voxels; free IoU is therefore unavailable.",
+            "Free IoU is defined only on observed free cells from ray tracing, not the full volume.",
         ],
     }
 
@@ -619,13 +619,20 @@ def evaluate(config, manifest, prediction_directory, output, split="val", video_
     else:
         detection = {"available": False, "reason": "Skipped by --skip-official."}
         tracking = {"available": False, "reason": "Skipped by --skip-official."}
+    grid_range = {"x": list(config["grid"]["x"]), "y": list(config["grid"]["y"])}
+    range_note = (
+        f"Predictions are limited to the configured ego grid {grid_range}; "
+        "the official protocol scores cars/trucks to 50 m and pedestrians to 40 m, "
+        "so objects outside the grid are counted as false negatives.")
     if detection.get("available") is not False:
         detection["drivescene_context"] = (
             "Official nuScenes protocol applied to raw detection-head candidates when retained; "
-            "ByteTrack output is used only for legacy inference artifacts.")
+            "CenterTracker identities are used only for the tracking submission. " + range_note)
+        detection["range_limitation"] = grid_range
     if tracking.get("available") is not False:
         tracking["drivescene_context"] = (
-            "AMOTP=2.0 is the protocol ceiling when recall is zero and is not a 2m successful-match measurement.")
+            "AMOTP=2.0 is the protocol ceiling when recall is zero and is not a 2m successful-match measurement. "
+            + range_note)
     video = _render_error_video(rows, worlds, map_frames, occupancy, video_output, fps) if video_output else None
     report = {"schema_version": "1.0", "split": split, "frames": len(rows),
               "manifest": str(manifest), "predictions": str(prediction_directory),

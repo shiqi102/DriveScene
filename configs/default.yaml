@@ -3,7 +3,7 @@ version: v1.0-mini
 base_manifest: data/processed/mini-v3.jsonl
 manifest: data/processed/mini-v3-with-occ.jsonl
 output: outputs
-artifact_output: /mnt/sh_data/common3share/17_端到端/users/wzy/DriveScene/outputs
+artifact_output: outputs
 camera_order: [CAM_FRONT, CAM_FRONT_RIGHT, CAM_BACK_RIGHT, CAM_BACK, CAM_BACK_LEFT, CAM_FRONT_LEFT]
 grid:
   x: [-30.0, 30.0]
@@ -24,12 +24,21 @@ model:
   detection_classes: [car, truck, construction_vehicle, bus, trailer, barrier, motorcycle, bicycle, pedestrian, traffic_cone]
   occupancy_classes: [free, occupied, drivable]
 tracking:
-  track_high_thresh: 0.5
-  track_low_thresh: 0.1
-  new_track_thresh: 0.6
-  track_buffer: 30
-  match_thresh: 0.8
-  fuse_score: true
+  min_score: 0.1
+  new_track_thresh: 0.5
+  max_age: 3
+  velocity_ema: 0.5
+  max_center_distance:
+    car: 4.0
+    truck: 4.0
+    construction_vehicle: 4.0
+    bus: 5.5
+    trailer: 3.0
+    barrier: 1.0
+    motorcycle: 13.0
+    bicycle: 3.0
+    pedestrian: 1.0
+    traffic_cone: 1.0
 compiler:
   detection_confidence: {car: 0.45, truck: 0.45, construction_vehicle: 0.50, bus: 0.45, trailer: 0.50, barrier: 0.50, motorcycle: 0.50, bicycle: 0.50, pedestrian: 0.45, traffic_cone: 0.50}
   detection_geometry:
@@ -72,6 +81,17 @@ training:
   # weights retain useful obstacle and drivable-surface gradients.
   occupancy_class_weights: [0.2, 1.0, 1.0]
   learning_rate: 5.0e-5
+  warmup_steps: 250
+  num_workers: 4
+  shuffle_scenes: true
+  val_frames: 16
+  augmentation:
+    enabled: true
+    brightness: 0.2
+    contrast: 0.2
+    saturation: 0.15
+    bev_rotation_degrees: 22.5
+    bev_flip_prob: 0.5
   map_loss:
     classification: 1.0
     point: 1.0
@@ -81,6 +101,8 @@ training:
     duplicate: 0.10
     topology_radius: 2.0
     duplicate_margin: 1.5
+    match_point_weight: 5.0
+    match_class_weight: 2.0
   detection_loss:
     classification: 2.0
     center: 5.0

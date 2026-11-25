@@ -30,6 +30,24 @@ def _setting(settings, name, kind, default):
     return float(value.get(kind, default) if isinstance(value, dict) else value)
 
 
+def clip_polylines(points, grid, min_length=0.2):
+    """Clip a polyline to the ego grid; ego motion may push tracks outside."""
+    from shapely.geometry import LineString, box
+    points = np.asarray(points, dtype=float)
+    if points.ndim != 2 or len(points) < 2:
+        return []
+    geometry = LineString(points).intersection(
+        box(grid["x"][0], grid["y"][0], grid["x"][1], grid["y"][1]))
+    if geometry.is_empty:
+        return []
+    parts = list(geometry.geoms) if hasattr(geometry, "geoms") else [geometry]
+    output = []
+    for part in parts:
+        if part.geom_type in ("LineString", "LinearRing") and part.length > min_length:
+            output.append(np.asarray(part.coords, dtype=float)[:, :2])
+    return output
+
+
 def _valid_geometry(points, kind, grid, settings):
     points = np.asarray(points, dtype=float)
     if points.ndim != 2 or points.shape[0] < 2 or points.shape[1] != 2 or not np.isfinite(points).all():
@@ -70,17 +88,18 @@ def postprocess_map(candidates, config):
         threshold = float(thresholds.get(candidate["kind"], default_threshold))
         if candidate["score"] < threshold:
             continue
-        vector = deepcopy(candidate)
-        points = smooth_polyline(vector["points"], geometry.get("smoothing_passes", 0))
-        if not _valid_geometry(points, vector["kind"], config["grid"], geometry):
-            continue
-        vector["points"] = points.tolist()
+        points = smooth_polyline(candidate["points"], geometry.get("smoothing_passes", 0))
         duplicate_threshold = float(geometry.get("duplicate_chamfer", 1.0))
-        if any(other["kind"] == vector["kind"] and
-               symmetric_chamfer(other["points"], vector["points"]) < duplicate_threshold
-               for other in accepted):
-            continue
-        accepted.append(vector)
+        for part in clip_polylines(points, config["grid"]):
+            if not _valid_geometry(part, candidate["kind"], config["grid"], geometry):
+                continue
+            vector = deepcopy(candidate)
+            vector["points"] = part.tolist()
+            if any(other["kind"] == vector["kind"] and
+                   symmetric_chamfer(other["points"], vector["points"]) < duplicate_threshold
+                   for other in accepted):
+                continue
+            accepted.append(vector)
     return accepted
 
 

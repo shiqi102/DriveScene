@@ -209,6 +209,31 @@ def _matched_bev_iou(first, second):
     return intersection/(first_area+second_area-intersection).clamp_min(1e-6)
 
 
+def _is_closed(item, tolerance=1e-3):
+    if "closed" in item:
+        return bool(item["closed"])
+    points = item["points"]
+    return len(points) > 2 and all(abs(a-b) <= tolerance for a, b in zip(points[0], points[-1]))
+
+
+def _polyline_permutations(gt, closed):
+    """[G,P,2] -> [G,2(P-1),P,2] equivalent orderings of each polyline.
+
+    Closed rings (first point == last point) may start anywhere and run either
+    way; open lines only have forward/reverse, repeated to a common count.
+    """
+    count = gt.shape[1]
+    ring = gt[:, :-1]
+    shifted = []
+    for shift in range(count-1):
+        rolled = torch.roll(ring, -shift, dims=1)
+        shifted.append(torch.cat([rolled, rolled[:, :1]], 1))
+    shifted = torch.stack(shifted, 1)
+    closed_orders = torch.cat([shifted, shifted.flip(2)], 1)
+    open_orders = torch.stack([gt, gt.flip(1)], 1).repeat_interleave(count-1, dim=1)
+    return torch.where(closed[:, None, None, None], closed_orders, open_orders)
+
+
 def supervised_loss(pred, targets, config):
     """Hungarian matching; missing tasks produce no loss, never fake negatives."""
     import numpy as np
@@ -230,11 +255,19 @@ def supervised_loss(pred, targets, config):
             if items:
                 gt_labels = torch.tensor([classes.index(item["kind"]) for item in items], device=logits.device)
                 if branch == "map":
+                    settings = config.get("training", {}).get("map_loss", {})
                     gt = logits.new_tensor([item["points"] for item in items])
+                    closed = torch.tensor([_is_closed(item) for item in items], device=logits.device)
+                    orders = _polyline_permutations(gt, closed)
                     points = pred[branch]["points"][index]
-                    forward = (points[:, None]-gt[None]).abs().mean((2, 3))
-                    reverse = (points[:, None]-gt.flip(1)[None]).abs().mean((2, 3))
-                    costs = torch.minimum(forward, reverse)
+                    extent = logits.new_tensor([config["grid"][axis][1]-config["grid"][axis][0]
+                                                for axis in ("x", "y")])
+                    # Normalized so point and class costs have comparable scale.
+                    order_costs = ((points[:, None, None]-orders[None])/extent).abs().mean((3, 4))
+                    point_costs, best_order = order_costs.min(-1)
+                    costs = (float(settings.get("match_point_weight", 5.0))*point_costs-
+                             float(settings.get("match_class_weight", 2.0))*
+                             logits.softmax(-1)[:, gt_labels])
                 else:
                     gt = logits.new_tensor([item["center"]+item["size"]+[np.sin(item["yaw"]), np.cos(item["yaw"])]+item["velocity"] for item in items])
                     boxes = pred[branch]["boxes"][index]
@@ -246,17 +279,14 @@ def supervised_loss(pred, targets, config):
                     pred_angle = F.normalize(boxes[:, 6:8], dim=-1, eps=1e-6)
                     gt_angle = F.normalize(gt[:, 6:8], dim=-1, eps=1e-6)
                     angle_cost = 1-pred_angle@gt_angle.T
-                    costs = 2*center_cost+size_cost+angle_cost
-                costs = costs-logits.softmax(-1)[:, gt_labels]
+                    costs = 2*center_cost+size_cost+angle_cost-logits.softmax(-1)[:, gt_labels]
                 rows, cols = linear_sum_assignment(costs.detach().cpu().numpy())
                 rows = torch.as_tensor(rows, device=logits.device)
                 cols = torch.as_tensor(cols, device=logits.device)
                 labels[rows] = gt_labels[cols]
                 if branch == "map":
                     matched = points[rows]
-                    selected = gt[cols]
-                    use_reverse = reverse[rows, cols] < forward[rows, cols]
-                    selected = torch.where(use_reverse[:, None, None], selected.flip(1), selected)
+                    selected = orders[cols, best_order[rows, cols]]
                     map_terms["point"] = F.smooth_l1_loss(matched, selected)
 
                     pred_delta = matched[:, 1:]-matched[:, :-1]
@@ -269,10 +299,12 @@ def supervised_loss(pred, targets, config):
                     gt_curve = selected[:, 2:]-2*selected[:, 1:-1]+selected[:, :-2]
                     map_terms["smoothness"] = F.smooth_l1_loss(pred_curve, gt_curve)
 
-                    if len(rows) > 1:
-                        pred_endpoints = matched[:, [0, -1]]
-                        gt_endpoints = selected[:, [0, -1]]
-                        count = len(rows)
+                    # Ring endpoints are arbitrary, so only open lines carry topology.
+                    open_lines = ~closed[cols]
+                    if int(open_lines.sum()) > 1:
+                        pred_endpoints = matched[open_lines][:, [0, -1]]
+                        gt_endpoints = selected[open_lines][:, [0, -1]]
+                        count = int(open_lines.sum())
                         pred_connectivity = torch.cdist(
                             pred_endpoints.flatten(0, 1), pred_endpoints.flatten(0, 1)
                         ).reshape(count, 2, count, 2).amin((1, 3))
