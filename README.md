@@ -20,14 +20,7 @@ Training and inference intermediates stay under the local `outputs/` directory.
 - 训练使用 DataLoader 预取、warmup+cosine 学习率、场景级 BEV 旋转/翻转和颜色抖动，并在保存 checkpoint 时记录 val loss。
 - `run --limit` 默认处理整个 manifest。官方检测/跟踪指标仍按 50 m / 40 m 协议计算，但模型输出只有 ±30 m，范围外真值会记为漏检。
 
-## 进入项目和环境检查
 
-```bash
-ssh 42
-cd /Data1/wzy/DriveScene
-scripts/run.sh doctor
-nvidia-smi
-```
 
 所有命令都应从项目根目录执行。`scripts/run.sh` 使用 Python 3.10 工程环境；官方旧版 OpenMMLab 模块使用 `.venv-openmmlab/bin/python`。
 
