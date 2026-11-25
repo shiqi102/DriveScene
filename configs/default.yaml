@@ -29,7 +29,7 @@ tracking:
   max_age: 3
   velocity_ema: 0.5
   max_center_distance:
-    car: 4.5
+    car: 4.0
     truck: 4.0
     construction_vehicle: 4.0
     bus: 5.5
